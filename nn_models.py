@@ -85,3 +85,4 @@ class oral_cnn(nn.Module):
         x = self.feature(x)
         x = self.classifier(x)
         return x
+    

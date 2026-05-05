@@ -8,6 +8,7 @@ from Prompt import ManagerPrompt, EvaluatorPrompt, ChatbotPrompt
 from Model import Manager, Worker_with_tools, Evaluator, Worker
 from State import Task_State
 from oral_predictor import oral_predict
+from oral_efficientnet import oral_efficientnet_predict
 
 # ── Routing helpers ───────────────────────────────────────────────
 
@@ -120,14 +121,22 @@ def manager_node(state: Task_State) -> dict:
         "messages":    delete_messages + [HumanMessage(content=parsed["query"])],
     }
 
+
 def image_worker_node(state: Task_State) -> dict:
     image_path = state["query"]
     image_type = state.get("image_type", "skin")
     print(f"DEBUG image_worker image_type: {image_type}")
 
     if image_type == "oral":
-        result = oral_predict(image_path)
-        combined = f"Oral CNN Result:\n{result}"
+        parallel = RunnableParallel(
+            oral_cnn=RunnableLambda(lambda p: oral_predict(p)),
+            oral_efficientnet=RunnableLambda(lambda p: oral_efficientnet_predict(p)),
+        )
+        results = parallel.invoke(image_path)
+        combined = (
+            f"Oral CNN Result:\n{results['oral_cnn']}\n\n"
+            f"Oral EfficientNet Result:\n{results['oral_efficientnet']}"
+        )
     else:
         parallel = RunnableParallel(
             efficientnet=RunnableLambda(lambda p: predict(p)),
@@ -143,7 +152,6 @@ def image_worker_node(state: Task_State) -> dict:
         **state,
         "messages": state["messages"] + [HumanMessage(content=combined)],
     }
-
 
 def worker_node(state: Task_State) -> dict:
     """Research path only — image queries never reach this node."""

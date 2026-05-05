@@ -42,4 +42,3 @@ Graph.add_edge("tools",    "Evaluator")
 Graph.add_edge("Evaluator", END)
 
 Workflow = Graph.compile(checkpointer=checkpointer)
-print(Workflow.get_graph().draw_ascii())
