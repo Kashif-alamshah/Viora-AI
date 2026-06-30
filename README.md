@@ -1,78 +1,118 @@
 # Viora AI — LangGraph Architecture
 
-Viora AI is a health-assistant agent built on LangGraph. It accepts text questions plus optional file uploads (PDF/image), routes the request through a manager agent to one or more specialist worker nodes backed by custom ML models, validates the result with an evaluator, and synthesizes a final response.
+Viora AI is a health-assistant agent built with LangGraph. It runs a `Chatbot` entry node for casual conversation, and only enters the full pipeline (`Manager → Worker/ImageWorker → Evaluator`) when the message contains an image or a research-style query. This document reflects the actual implementation in [Kashif-alamshah/Viora-AI](https://github.com/Kashif-alamshah/Viora-AI).
 
-## High-level flow
+## Graph topology (`Graph.py`)
 
 ```
-User input (text + optional PDF/image)
-        │
-        ▼
-Multimodal detector  ── parses file type, extracts text/visual content
-        │
-        ▼
-Manager agent  ── classifies intent, decides which worker(s) to dispatch
-        │
-        ├──► Radiology worker     ──► Imaging oncology model
-        ├──► Pathology worker     ──► Pathology NLP model
-        ├──► Symptom worker       ──► Triage classifier model
-        └──► General QA worker    ──► Health QA LLM / RAG
-        │
-        ▼
-Evaluator node  ── checks confidence, flags hallucination risk
-        │
-        ├── pass  ──► Response synthesizer ──► Final response
-        └── retry ──► back to Manager agent
+START
+  │
+  ▼
+Chatbot ──(route_from_chatbot)──► END                [no pipeline needed]
+  │
+  ▼ (ROUTE_TO_PIPELINE)
+Manager ──(route_from_manager)──┬──► ImageWorker ──► Evaluator ──► END
+                                  └──► Worker ──(tools_condition)──► tools ──► Evaluator ──► END
 ```
 
-## Components
+Built with `StateGraph(Task_State)` and compiled with a `checkpointer` for cross-turn memory:
 
-### 1. Multimodal detector
-Entry node. Detects whether the input includes a PDF or image, parses it (OCR / layout extraction for PDFs, basic preprocessing for images), and normalizes everything into a single state object before the manager sees it.
+```python
+Graph.add_node("Chatbot", chat_worker)
+Graph.add_node("Manager", manager_node)
+Graph.add_node("ImageWorker", image_worker_node)
+Graph.add_node("Worker", worker_node)
+Graph.add_node("tools", tool_node)
+Graph.add_node("Evaluator", evaluator_node)
 
-### 2. Manager agent
-The orchestrator. Owns the `AgentState` and uses LangGraph `conditional_edges` to route to one or more worker nodes based on intent classification (e.g. "this is a radiology scan" → radiology worker; "this is a general question" → QA worker). Multiple workers can be fanned out in parallel via `asyncio.gather`.
+Graph.add_edge(START, "Chatbot")
+Graph.add_conditional_edges("Chatbot", route_from_chatbot, {"Manager": "Manager", END: END})
+Graph.add_conditional_edges("Manager", route_from_manager, {"ImageWorker": "ImageWorker", "Worker": "Worker"})
+Graph.add_edge("ImageWorker", "Evaluator")
+Graph.add_conditional_edges("Worker", tools_condition)
+Graph.add_edge("tools", "Evaluator")
+Graph.add_edge("Evaluator", END)
+```
 
-### 3. Worker nodes
-Each worker is a thin LangGraph node, not the model itself. Its job:
-1. **Pre-process** — resize an image, extract PDF text, tokenize symptom text, etc.
-2. **Call your ML model** — local `model.predict()`, a FastAPI inference endpoint, or a hosted endpoint (SageMaker, Vertex AI, etc.).
-3. **Post-process** — package the prediction with a confidence score and write it back into state.
+## State (`State.py`)
 
-Current workers:
-| Worker | Backing model |
-|---|---|
-| Radiology | Imaging oncology model |
-| Pathology | Pathology NLP / report parsing model |
-| Symptom | Triage classifier model |
-| General QA | Health QA LLM / RAG |
+```python
+class Task_State(TypedDict):
+    instruction: str
+    query: str
+    task: str
+    image_type: str
+    output: str
+    summary: str                              # running conversation summary
+    messages: Annotated[list, add_messages]           # scratchpad (tool calls, image results)
+    whole_messages: Annotated[list[BaseMessage], add_messages]  # full chat history
+```
 
-All workers resolve their model from a **shared model registry**, so model versions can be swapped (`radiology_v2` → `radiology_v3`) without touching graph logic.
+## Nodes (`Utility.py`)
 
-### 4. Evaluator node
-Implements the manager-evaluator pattern. Reads confidence scores from whichever workers ran, checks for hallucination risk and low-confidence predictions, and either:
-- **passes** the result downstream to synthesis, or
-- **retries** by routing back to the manager (different model, stricter parameters, or escalation).
+### Chatbot (`chat_worker`)
+The entry point for every message. It:
+- Checks the last `HumanMessage` for an image file extension (`.jpg`, `.jpeg`, `.png`, `.bmp`, `.webp`) or research keywords (`research`, `paper`, `study`, `pubmed`, `arxiv`). Either match sets `output = "ROUTE_TO_PIPELINE"`.
+- If the conversation exceeds 10 messages, it summarizes the older messages via the `Worker` LLM and keeps only the last 4 for immediate context, deleting the rest with `RemoveMessage`.
+- Otherwise responds directly as a conversational chatbot using `ChatbotPrompt | Worker`, ending the turn without entering the pipeline.
 
-### 5. Response synthesizer
-Merges outputs from all workers that contributed, attaches source/model citations, formats the final reply, and pulls conversation history from the state store.
+`route_from_chatbot` sends the state to `Manager` only when `output == "ROUTE_TO_PIPELINE"`, otherwise the graph ends.
 
-### 6. Tool layer
-Supporting tools available to the graph: medical RAG retrieval, web search, EHR/FHIR connectors, human clinician escalation, and audit logging.
+### Manager (`manager_node`)
+Runs `ManagerPrompt | Manager` (an LLM call) on the last human message, parsing a JSON response into `instruction`, `query`, and `task`. It also infers `image_type` ("oral" vs "skin") by keyword-matching ("oral", "mouth", "tongue", "gum", "lip"). It wipes the prior turn's scratchpad (`messages`) with `RemoveMessage` so the worker doesn't see stale tool calls or image paths from earlier turns.
 
-### 7. State store
-Holds conversation history and intermediate state across turns, accessible by the manager and synthesizer.
+`route_from_manager` sends `task == "image"` to `ImageWorker`, everything else to `Worker`.
 
-## Suggested implementation notes
+### ImageWorker (`image_worker_node`)
+This is the worker layer with direct ML model access. It branches on `image_type`:
 
-- Use `StateGraph` with a typed `AgentState` (TypedDict or Pydantic model) covering: raw input, parsed file content, intent, worker outputs, confidence scores, retry count.
-- Manager → workers: `conditional_edges` based on intent classification output.
-- Worker → ML model: keep this call inside the worker node function; do not expose the model directly to the graph.
-- Evaluator → `END` or back to manager: implement as a conditional edge checking a confidence threshold (e.g. `< 0.7` triggers retry, capped at N retries to avoid infinite loops).
-- Parallel worker execution: use LangGraph's fan-out/fan-in pattern with `asyncio.gather` for workers running concurrently, then a join node before the evaluator.
+| image_type | Models run in parallel (`RunnableParallel`) | Source file |
+|---|---|---|
+| `oral` | `oral_predict()` + `oral_efficientnet_predict()` | `oral_predictor.py`, `oral_efficientnet.py` |
+| `skin` (default) | `predict()` (EfficientNet) + `cnn_predict()` (CNN) | `predictor.py`, `cnn_predictor.py` |
 
-## Next steps / open questions
-- [ ] Define confidence threshold(s) per worker type
-- [ ] Define max retry count before forced human escalation
-- [ ] Decide model serving approach (local vs hosted endpoint) per worker
-- [ ] Finalize state store schema
+Both models in a pair run concurrently on the same image path; their results are combined into a single message and appended to `messages` before going straight to `Evaluator` — no tool-calling LLM in this path.
+
+### Worker (`worker_node`) — research path only
+Invoked when `task != "image"`. Calls `Worker_with_tools` (`WorkerPrompt | Worker.bind_tools(tools, tool_choice="any", parallel_tool_calls=True)`), which can call any of:
+
+| Tool | Purpose | Source |
+|---|---|---|
+| `get_top_pubmed_papers` | PubMed literature search | `tools.py` |
+| `get_top_arxiv_papers` | arXiv paper search | `tools.py` |
+| `skin_cancer_predictor` | EfficientNet skin model, exposed as a tool | `tools.py` |
+| `skin_cancer_cnn_predictor` | CNN skin model, exposed as a tool | `tools.py` |
+
+`tools_condition` (from `langgraph.prebuilt`) checks whether the LLM requested a tool call; if so the graph executes the matching tool node, then proceeds to `Evaluator`.
+
+### Evaluator (`evaluator_node`)
+Runs `EvaluatorPrompt | Evaluator` over the full `messages` history (model predictions, tool results, etc.), appends its judgment to `messages`, and writes the final text to `state["output"]`. This is the manager-evaluator pattern: a separate LLM call reviews everything the worker/image path produced before the graph ends.
+
+## Models (`Model.py`)
+Three separate `ChatOpenAI` instances, each configurable via env vars (`MANAGER_MODEL`, `EVALUATOR_MODEL`, `WORKER_MODEL`) against a shared `BASE_URL`:
+
+```python
+Manager   = ChatOpenAI(model=os.getenv("MANAGER_MODEL"), ...)
+Evaluator = ChatOpenAI(model=os.getenv("EVALUATOR_MODEL"), ...)
+Worker    = ChatOpenAI(model=os.getenv("WORKER_MODEL"), ...)
+```
+
+This lets you run a cheaper/faster model for routing (`Manager`) and a stronger model for evaluation, independently.
+
+## Supporting modules
+- **`memory.py`** — `checkpointer`, persists `Task_State` across turns (likely per `thread_id`) so the graph can be invoked conversationally.
+- **`anonymizer.py`** — scrubs PHI/identifying information, presumably applied to inputs or outputs given the health-data context.
+- **`nn_models.py`** — shared neural-net model loading/definitions used by the predictor files.
+- **`Doctor/`** — separate module, not yet inspected (worth documenting once reviewed).
+
+## Notes on the manager-evaluator pattern as implemented
+- There is **one Manager** (routes to image vs research) and **one Evaluator** (reviews final output) — both LLM calls, not a model-per-worker registry.
+- The "workers" with direct ML model access are the four oncology/lesion classifiers inside `ImageWorker`, called directly as Python functions wrapped in `RunnableParallel`, not as LangChain tools.
+- The two skin models (`skin_cancer_predictor`, `skin_cancer_cnn_predictor`) are *also* exposed as LangChain tools to the `Worker` node, so the LLM-driven research path can invoke them on demand in addition to the always-on parallel path in `ImageWorker`.
+- There is currently **no retry edge** from `Evaluator` back to `Manager` — `Evaluator` always proceeds to `END`. If you want the manager-evaluator retry loop described in your earlier sketch, that conditional edge would need to be added.
+
+## Suggested next steps
+- [ ] Add a conditional edge from `Evaluator` back to `Manager` (or a dedicated retry node) gated on a confidence/quality check, to fully realize the retry loop.
+- [ ] Document `Doctor/` and `nn_models.py` once reviewed.
+- [ ] Confirm what `anonymizer.py` is applied to (raw upload, query text, or stored memory).
+- [ ] Decide whether oral/skin model selection should also be exposed in the `Worker` tool-calling path (currently only skin models are tools).
